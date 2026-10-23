@@ -10,7 +10,7 @@ from .lion import multi_tensor_lion
 from .mixed_moe_gemm import mixed_moe_gemm
 from .packbits import packbits
 from .unpackbits import unpackbits
-from .wf6af16_linear import wf6af16_linear
+from .moe_gemm import moe_gemm
 
 __all__ = [
     "blocked_flash",
@@ -20,7 +20,7 @@ __all__ = [
     "multi_tensor_lion",
     "packbits",
     "unpackbits",
-    "wf6af16_linear",
+    "moe_gemm",
 ]
 
 SpecOpRegistrar(registry=globals(), vendor=runtime_device.vendor_name).apply()
