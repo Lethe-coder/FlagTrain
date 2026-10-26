@@ -1,4 +1,16 @@
-#16bit moe_gemm_triton
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import logging
 
@@ -13,7 +25,8 @@ from flag_train.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-@libentry()
+
+@libentry
 @triton.jit
 def moe_gemm_kernel(
     output_ptr,
@@ -36,11 +49,17 @@ def moe_gemm_kernel(
 ):
     tile = tle.program_id(0)
     expert = tle.program_id(1)
+
+    # Map the linear tile index to the row and column tile indices.
     tiles_n = tl.cdiv(N, BLOCK_N)
     tile_m = tile // tiles_n
     tile_n = tile % tiles_n
+
+    # Obtain the token row range assigned to the current expert.
     first_row = tl.load(row_ends_ptr + expert - 1, expert > 0, other=0)
     last_row = tl.load(row_ends_ptr + expert)
+
+    # Skip tiles that do not contain any rows assigned to this expert.
     if tile_m * BLOCK_M < last_row - first_row:
         rows = first_row + tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -48,7 +67,9 @@ def moe_gemm_kernel(
         row_mask = (rows < last_row) & (rows < M)
         col_mask = cols < N
         expert_offset = expert.to(tl.int64)
+        # Accumulate matrix multiplication results in FP32.
         accumulator = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+
         for block_k in range(tl.cdiv(K, BLOCK_K)):
             ks = block_k * BLOCK_K + offsets_k
             inputs = tl.load(
@@ -57,9 +78,7 @@ def moe_gemm_kernel(
                 other=0,
             )
             weight_offsets = (
-                expert_offset * K * N
-                + ks[:, None].to(tl.int64) * N
-                + cols[None, :]
+                expert_offset * K * N + ks[:, None].to(tl.int64) * N + cols[None, :]
             )
             weights = tl.load(
                 weight_ptr + weight_offsets,
@@ -90,6 +109,7 @@ def moe_gemm_kernel(
             accumulator,
             row_mask[:, None] & col_mask[None, :],
         )
+
 
 def _validate_inputs(
     output,
@@ -143,6 +163,7 @@ def _validate_inputs(
         raise ValueError("weights, biases, and row ends must be contiguous")
     return m, n, k, num_experts
 
+
 def moe_gemm(
     output,
     hidden_states,
@@ -151,6 +172,21 @@ def moe_gemm(
     total_rows_before_expert,
     activation=6,
 ):
+    """Compute MoE GEMM with torch.float16/torch.bfloat16 inputs and weights, writing into output.
+    Activations are already ordered by expert; this operator does not route
+    tokens or combine top-k expert outputs.
+    Args:
+    output: Output tensor with the same dtype as hidden_states, shape [tokens, N].
+    ```
+    hidden_states: Input tensor with dtype ``torch.float16`` or ``torch.bfloat16``, shape [tokens, K].
+    weights: Weight tensor with dtype ``torch.float16`` or ``torch.bfloat16``, shape [experts, K, N].
+    biases: Optional bias tensor, shape [experts, N], with the same dtype as ``hidden_states``.
+    total_rows_before_expert: Cumulative row ends for each expert, shape [experts], with dtype ``torch.int64``.
+    activation: Activation function identifier: GELU=0, RELU=1, SILU=2, IDENTITY=6.
+    ```
+    Returns:
+    The output tensor containing the computed results.
+    """
     logger.debug("TRAIN MOE_GEMM")
     m, n, k, num_experts = _validate_inputs(
         output,
