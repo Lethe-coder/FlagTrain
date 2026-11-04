@@ -66,7 +66,7 @@ from flag_train.utils import triton_lang_extension as tle
 logger = logging.getLogger(__name__)
 
 
-@libentry
+@libentry()
 @triton.jit
 def moe_gemm_kernel(
     output_ptr,
