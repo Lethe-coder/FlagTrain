@@ -24,9 +24,10 @@
 #                  installed. Never install a vendor stack next to the one the
 #                  image was built with.
 #   --no-prebuilt  also install this backend's `deps:` from backends.yaml,
-#                  through the vendor's package index -- for a vendor image
-#                  that does not carry the FlagOS stack (thead's own pytorch
-#                  image).
+#                  through the vendor's package index. Every backend uses this
+#                  today, so the pins -- including the test reference packages
+#                  in them, megatron-core for one -- are installed rather than
+#                  assumed to be in the image.
 #
 # Everything comes out of backends.yaml, the same file the nvidia runner image
 # documents its pins in:
@@ -224,24 +225,20 @@ fi
 # setuptools>=77 is the repo's build requirement (PEP 639 metadata); install it
 # first so `--no-build-isolation` below has a backend to use.
 python3 -m pip install "${pip_args[@]}" --upgrade "setuptools>=77"
-python3 -m pip install "${pip_args[@]}" --no-build-isolation -e "${REPO_ROOT}"
-# The test dependencies, plus the packages a vendor stack uses without
-# declaring them -- the same set the FlagOS runtime images preinstall as their
-# runtime_prereqs (build-infra's configs.yaml), at the same versions:
-#   numpy     tests/accuracy_utils.py, and torch_npu's profiler, which torch
-#             2.11 pulls in through its device-backend autoload -- without it
-#             `import torch` fails.
+
+# Packages triton imports at run time without declaring them -- the same ones
+# the FlagOS runtime images preinstall as their runtime_prereqs
+# (build-infra's configs.yaml):
 #   pybind11  imported at run time by triton/backends/ascend/utils.py, so
 #             `import triton` fails without it (flagtree's wheel does not
 #             declare it).
 #   ninja     triton JIT-builds its launcher with it.
 # A native runner's fresh venv has none of them; a prebuilt image does.
-python3 -m pip install "${pip_args[@]}" pytest pyyaml sqlalchemy packaging numpy \
-    pybind11==3.0.3 ninja==1.13.0
+python3 -m pip install "${pip_args[@]}" pybind11==3.0.3 ninja==1.13.0
 
-# The vendor stack goes last, so a backend's own pins win over the shared list
-# above (iluvatar's `numpy<2`, for one). Skipped when the image already ships
-# the stack.
+# The vendor stack goes in first, so a backend's own pins win where they
+# overlap with FlagTrain's metadata (iluvatar's `numpy<2`, for one). Skipped
+# when the image already ships the stack.
 if [ "${PREBUILT}" -eq 0 ]; then
     if [ -n "${COMPILER_PKG}" ]; then
         echo "installing ${BACKEND} compiler (${COMPILER_PKG})"
@@ -255,6 +252,13 @@ if [ "${PREBUILT}" -eq 0 ]; then
         python3 -m pip install "${pip_args[@]}" ${DEPS}
     fi
 fi
+
+# FlagTrain plus its test dependencies, as declared in pyproject.toml's
+# `[test]` extra (pytest only). The reference packages the tests import
+# (megatron-core) are declared in `deps:` above, next to the vendor stack, and
+# are installed only with --no-prebuilt -- the mode every backend uses today.
+# pyyaml/sqlalchemy/numpy/packaging come from the package's core dependencies.
+python3 -m pip install "${pip_args[@]}" --no-build-isolation -e "${REPO_ROOT}[test]"
 
 echo "checking that FlagTrain imports on this platform"
 python3 -c "import flag_train; print('flag_train:', flag_train.vendor_name, '/', flag_train.device)"
