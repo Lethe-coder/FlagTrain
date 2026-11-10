@@ -12,6 +12,7 @@ from .multi_tensor_adam import multi_tensor_adam
 from .multi_tensor_lion import multi_tensor_lion
 from .packbits import packbits
 from .unpackbits import unpackbits
+from .wf6af16_linear import wf6af16_linear
 
 __all__ = [
     "blocked_flash",
@@ -26,7 +27,5 @@ __all__ = [
     "multi_tensor_lion",
     "packbits",
     "unpackbits",
+    "wf6af16_linear",
 ]
-
-# The vendor-operator registration for these names runs in flag_train/__init__.py
-# once this package and its siblings are fully imported -- see the comment there.
