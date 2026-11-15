@@ -53,6 +53,8 @@ RUNNING
     keeps them off backends that do not ship the fused kernel.
 """
 
+import warnings
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -192,6 +194,47 @@ def _reference(x, weights, biases, counts, activation):
     return utils.to_reference(result.to(x.dtype).to(x.device))
 
 
+def _reference_with_deepspeed(x, weights, biases, rows, counts, activation):
+    """Prefer DeepSpeed's native MoE GEMM as the reference implementation.
+
+    If the DeepSpeed native implementation is unavailable or does not support
+    the current case, fall back to the independent CPU FP64 reference.
+    """
+    try:
+        from deepspeed.inference.v2.inference_utils import ActivationType
+        from deepspeed.ops.op_builder import InferenceCutlassBuilder
+
+        # Load the native DeepSpeed CUTLASS implementation.
+        inf_module = InferenceCutlassBuilder().load()
+        moe_gemm_op = inf_module.moe_gemm
+
+        # DeepSpeed writes the result into the supplied output buffer.
+        reference_output = torch.empty(
+            (x.shape[0], weights.shape[2]),
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+        moe_gemm_op(
+            reference_output,
+            x,
+            weights,
+            biases,
+            rows,
+            ActivationType(activation),
+        )
+
+        return utils.to_reference(reference_output)
+
+    except Exception as exc:
+        warnings.warn(
+            "DeepSpeed native MoE GEMM is unavailable for this case. "
+            f"Falling back to the CPU FP64 reference: {exc}",
+            RuntimeWarning,
+        )
+        return _reference(x, weights, biases, counts, activation)
+
+
 def _assert_close(output, expected):
     """Compare the operator's output to the CPU FP64 oracle.
 
@@ -233,7 +276,7 @@ def test_moe_gemm(counts, k, n, dtype, activation, has_bias):
         biases = None
     # Build the oracle first: the operator writes into ``output`` in place, so
     # any comparison computed afterwards would be against already-written data.
-    expected = _reference(x, weights, biases, counts, activation)
+    expected = _reference_with_deepspeed(x, weights, biases, counts, activation)
     result = flag_train.deepspeed.moe_gemm(output, x, weights, biases, rows, activation)
     # Identity, not value equality: the contract is that the caller's buffer is
     # filled and returned, and an internal copy would pass a value comparison.
@@ -253,7 +296,7 @@ def test_moe_gemm_strides(dtype):
     # 0 but the interesting work starts at a non-zero row.
     counts = [0, 1, 17, 0, 5]
     output, x, weights, biases, rows = _inputs(counts, 71, 35, dtype, strided=True)
-    expected = _reference(x, weights, biases, counts, 6)
+    expected = _reference_with_deepspeed(x, weights, biases, counts, 6)
     # The strided output returned above is discarded and rebuilt here so that
     # the padding storage is reachable from the test body; the shapes are the
     # same as in ``_inputs``: 70 columns hold the 35 viewed ones, 2 rows hold 1.
@@ -284,7 +327,7 @@ def test_moe_gemm_empty_dimensions(counts, k, n):
     output, x, weights, biases, rows = _inputs(counts, k, n, torch.float16)
     # SiLU on purpose: with K == 0 the output is act(bias), so the activation
     # must still run on a matrix product that contributed nothing.
-    expected = _reference(x, weights, biases, counts, 2)
+    expected = _reference_with_deepspeed(x, weights, biases, counts, 2)
     result = flag_train.deepspeed.moe_gemm(output, x, weights, biases, rows, 2)
     assert result is output
     _assert_close(output, expected)
@@ -331,7 +374,7 @@ def test_moe_gemm_graph_capture():
     graph.replay()
     # Identity activation, so the only thing under test is the routing read
     # from the mutated ``rows`` buffer.
-    expected = _reference(x, weights, biases, new_counts, 6)
+    expected = _reference_with_deepspeed(x, weights, biases, new_counts, 6)
     _assert_close(output, expected)
 
 
@@ -346,7 +389,7 @@ def test_mixed_moe_gemm_large_k(dtype):
     # loop, which is where an off-by-one loop bound or a missing K guard breaks.
     counts = [128]
     output, x, weights, biases, rows = _inputs(counts, 2048, 2048, dtype)
-    expected = _reference(x, weights, biases, counts, 2)
+    expected = _reference_with_deepspeed(x, weights, biases, counts, 2)
     flag_train.deepspeed.moe_gemm(output, x, weights, biases, rows, 2)
     _assert_close(output, expected)
 
@@ -370,8 +413,8 @@ def test_moe_gemm_two_layers(dtype):
     flag_train.deepspeed.moe_gemm(hidden, x, weights, biases, rows, 2)
     flag_train.deepspeed.moe_gemm(output, hidden, weights2, biases2, rows)
     # The oracle is composed the same way, layer by layer, in FP64.
-    hidden_ref = _reference(x, weights, biases, counts, 2)
-    expected = _reference(hidden_ref, weights2, biases2, counts, 6)
+    hidden_ref = _reference_with_deepspeed(x, weights, biases, counts, 2)
+    expected = _reference_with_deepspeed(hidden_ref, weights2, biases2, counts, 6)
     _assert_close(output, expected)
 
 

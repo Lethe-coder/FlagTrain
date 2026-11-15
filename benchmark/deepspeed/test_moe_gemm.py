@@ -45,6 +45,9 @@ RUNNING
     keeps it off backends without the fused kernel.
 """
 
+import warnings
+from functools import lru_cache
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -146,6 +149,60 @@ def torch_op(output, x, weights, biases, rows, activation):
     return output
 
 
+@lru_cache(maxsize=1)
+def _load_deepspeed_moe_gemm():
+    """Load DeepSpeed only once to exclude module loading time from benchmark timings."""
+    try:
+        from deepspeed.inference.v2.inference_utils import ActivationType
+        from deepspeed.ops.op_builder import InferenceCutlassBuilder
+
+        inf_module = InferenceCutlassBuilder().load()
+        return inf_module.moe_gemm, ActivationType
+
+    except Exception as exc:
+        warnings.warn(
+            "DeepSpeed native MoE GEMM is unavailable. "
+            f"Falling back to the PyTorch baseline: {exc}",
+            RuntimeWarning,
+        )
+        return None
+
+
+def baseline_op(output, x, weights, biases, rows, activation):
+    """Prefer DeepSpeed and fall back to the original PyTorch implementation on failure."""
+    native = _load_deepspeed_moe_gemm()
+
+    if native is not None:
+        moe_gemm_op, activation_type = native
+
+        try:
+            moe_gemm_op(
+                output,
+                x,
+                weights,
+                biases,
+                rows,
+                activation_type(activation),
+            )
+            return output
+
+        except Exception as exc:
+            warnings.warn(
+                "DeepSpeed native MoE GEMM failed for this case. "
+                f"Falling back to the PyTorch baseline: {exc}",
+                RuntimeWarning,
+            )
+
+    return torch_op(
+        output,
+        x,
+        weights,
+        biases,
+        rows,
+        activation,
+    )
+
+
 def input_fn(shape, dtype, device, activation):
     """Build one benchmark case and check it against the baseline first.
 
@@ -190,7 +247,7 @@ def input_fn(shape, dtype, device, activation):
     args = (output, x, weights, biases, rows, activation)
     # The baseline writes ``output`` in place; clone so the operator's call
     # below cannot overwrite the values being compared against.
-    expected = torch_op(*args).clone()
+    expected = baseline_op(*args).clone()
     flag_train.deepspeed.moe_gemm(*args)
     # BF16 has fewer mantissa bits than FP16, so its tolerance is one order of
     # magnitude looser; both are chosen to admit the kernel's tiled FP32
@@ -241,7 +298,7 @@ def test_moe_gemm_perf(activation):
     bench = MoEGEMMBenchmark(
         input_fn=make_inputs,
         op_name="moe_gemm",
-        torch_op=torch_op,
+        torch_op=baseline_op,
         dtypes=[torch.float16, torch.bfloat16],
     )
     # ``set_train`` registers the implementation under test; the same callable
