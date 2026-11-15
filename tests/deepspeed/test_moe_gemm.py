@@ -194,12 +194,18 @@ def _reference(x, weights, biases, counts, activation):
     return utils.to_reference(result.to(x.dtype).to(x.device))
 
 
-def _reference_with_deepspeed(x, weights, biases, rows, counts, activation):
+def _reference_with_deepspeed(x, weights, biases, counts, activation):
     """Prefer DeepSpeed's native MoE GEMM as the reference implementation.
 
     If the DeepSpeed native implementation is unavailable or does not support
     the current case, fall back to the independent CPU FP64 reference.
     """
+    rows = torch.tensor(
+        counts,
+        dtype=torch.int64,
+        device=x.device,
+    ).cumsum(0)
+
     try:
         from deepspeed.inference.v2.inference_utils import ActivationType
         from deepspeed.ops.op_builder import InferenceCutlassBuilder
